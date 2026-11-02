@@ -97,7 +97,25 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS meta (
                     key TEXT PRIMARY KEY, value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS business_connections (
+                    id TEXT PRIMARY KEY,
+                    owner_id INTEGER NOT NULL,
+                    is_enabled INTEGER NOT NULL,
+                    can_reply INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS business_buyers (
+                    chat_id INTEGER PRIMARY KEY,
+                    connection_id TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    last_incoming_epoch INTEGER NOT NULL,
+                    FOREIGN KEY(connection_id) REFERENCES business_connections(id)
+                );
             """)
+            # Safe, one-time migration for existing Railway databases.
+            columns = [r[1] for r in conn.execute("PRAGMA table_info(offers)")]
+            if "business_connection_id" not in columns:
+                conn.execute("ALTER TABLE offers ADD COLUMN business_connection_id TEXT")
 
     @contextmanager
     def connect(self):
@@ -149,10 +167,11 @@ class Storage:
                 ORDER BY created_epoch DESC LIMIT 1""", (user_id, item_id)).fetchone()
         return bool(row and (time.time() - row["created_epoch"] < 120))
 
-    def save_offer(self, payload, user_id, item_id, price):
+    def save_offer(self, payload, user_id, item_id, price, business_connection_id=None):
         with self.connect() as c:
-            c.execute("INSERT INTO offers(payload,user_id,item_id,price,created_at,created_epoch) VALUES(?,?,?,?,?,?)",
-                      (payload, user_id, item_id, price, utc_now(), int(time.time())))
+            c.execute("""INSERT INTO offers(payload,user_id,item_id,price,created_at,created_epoch,business_connection_id)
+                        VALUES(?,?,?,?,?,?,?)""",
+                      (payload, user_id, item_id, price, utc_now(), int(time.time()), business_connection_id))
 
     def mark_sent(self, payload):
         with self.connect() as c:
@@ -179,6 +198,59 @@ class Storage:
             item_count = c.execute("SELECT COUNT(*) FROM items WHERE active=1").fetchone()[0]
             sales = c.execute("SELECT COUNT(*), COALESCE(SUM(price),0), COUNT(DISTINCT user_id) FROM sales").fetchone()
         return item_count, sales[0], sales[1], sales[2]
+
+
+    def save_business_connection(self, connection, owner_id):
+        """Persist only the admin's own connection. Never accept third-party owners."""
+        user = connection.get("user") or {}
+        if user.get("id") != owner_id:
+            return False
+        rights = connection.get("rights") or {}
+        can_reply = bool(rights.get("can_reply", connection.get("can_reply", False)))
+        with self.connect() as c:
+            c.execute("""INSERT INTO business_connections(id,owner_id,is_enabled,can_reply,updated_at)
+                         VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                         owner_id=excluded.owner_id,is_enabled=excluded.is_enabled,
+                         can_reply=excluded.can_reply,updated_at=excluded.updated_at""",
+                      (connection["id"], owner_id, int(bool(connection.get("is_enabled"))),
+                       int(can_reply), utc_now()))
+        return True
+
+    def business_connection(self, connection_id):
+        with self.connect() as c:
+            row = c.execute("SELECT * FROM business_connections WHERE id=?", (connection_id,)).fetchone()
+            return dict(row) if row else None
+
+    def save_business_buyer(self, chat_id, connection_id, name, incoming_epoch):
+        with self.connect() as c:
+            c.execute("""INSERT INTO business_buyers(chat_id,connection_id,display_name,last_incoming_epoch)
+                         VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET
+                         connection_id=excluded.connection_id,
+                         display_name=excluded.display_name,
+                         last_incoming_epoch=MAX(business_buyers.last_incoming_epoch, excluded.last_incoming_epoch)""",
+                      (chat_id, connection_id, name[:80], int(incoming_epoch)))
+
+    def eligible_business_buyer(self, chat_id, owner_id):
+        with self.connect() as c:
+            row = c.execute("""SELECT b.*, c.can_reply, c.is_enabled, c.owner_id
+                             FROM business_buyers b JOIN business_connections c ON b.connection_id=c.id
+                             WHERE b.chat_id=? AND c.owner_id=?""", (chat_id, owner_id)).fetchone()
+        if not row or not row["is_enabled"] or not row["can_reply"]:
+            return None
+        # Business replies are restricted to chats with recent incoming messages.
+        if int(time.time()) - row["last_incoming_epoch"] >= 24 * 3600:
+            return None
+        return dict(row)
+
+    def eligible_business_buyers(self, owner_id):
+        cutoff = int(time.time()) - 24 * 3600
+        with self.connect() as c:
+            rows = c.execute("""SELECT b.* FROM business_buyers b
+                            JOIN business_connections c ON b.connection_id=c.id
+                            WHERE c.owner_id=? AND c.is_enabled=1 AND c.can_reply=1
+                              AND b.last_incoming_epoch>? ORDER BY b.last_incoming_epoch DESC LIMIT 40""",
+                             (owner_id, cutoff)).fetchall()
+        return [dict(row) for row in rows]
 
     def get_offset(self):
         with self.connect() as c:
@@ -219,7 +291,8 @@ class StarsBot:
             "/help — commands" +
             ("\n\nADMIN:\n/add — create a paid item\n/items — list active items\n"
              "/delete ID — hide an item\n/stats — local purchase stats\n"
-             "/balance — Telegram bot Stars balance\n/cancel — cancel upload"
+             "/balance — Telegram bot Stars balance\n/buyers — recent Business-chat buyers\n"
+             "/sendbuyer CHAT_ID ITEM_ID — send to personal chat\n/cancel — cancel upload"
              if uid == self.admin else ""),
             inline_buttons([[b("🛍️ Browse locked media", "catalog")]]))
 
@@ -286,7 +359,8 @@ class StarsBot:
         if not offer:
             LOG.warning("Received unknown paid-media purchase payload; verify retained DB and data volume")
             return
-        if new:
+        if new and not offer.get("business_connection_id"):
+            # Business buyers might not have a private chat with the bot.
             # Sending this notice is non-essential: the original paid media is
             # already unlocked by Telegram after successful payment.
             try:
@@ -294,6 +368,99 @@ class StarsBot:
                                "You can also use /library to reopen it.")
             except ApiError:
                 LOG.warning("Payment saved, but buyer confirmation message failed")
+
+
+    def handle_business_connection(self, connection):
+        if self.db.save_business_connection(connection, self.admin):
+            LOG.info("Admin business connection updated (enabled=%s)", bool(connection.get("is_enabled")))
+
+    def handle_business_message(self, msg):
+        """Store only eligible buyer IDs; no business-chat content is copied or stored."""
+        connection_id = msg.get("business_connection_id")
+        user = msg.get("from") or {}
+        chat = msg.get("chat") or {}
+        if not connection_id or chat.get("type") != "private":
+            return
+        uid, chat_id = user.get("id"), chat.get("id")
+        if not isinstance(uid, int) or uid == self.admin or user.get("is_bot") or uid != chat_id:
+            return
+        connection = self.db.business_connection(connection_id)
+        if connection is None:
+            # Handles connecting the bot before deploying this update.
+            try:
+                fresh = self.api.call("getBusinessConnection", {"business_connection_id": connection_id})
+            except ApiError:
+                LOG.warning("Cannot validate business connection; ignoring message")
+                return
+            self.db.save_business_connection(fresh, self.admin)
+            connection = self.db.business_connection(connection_id)
+        if not connection or connection["owner_id"] != self.admin or not connection["is_enabled"]:
+            return
+        when = int(msg.get("date") or 0)
+        if when <= 0 or when > int(time.time()) + 300:
+            return
+        name = (user.get("first_name") or "Buyer") + " " + (user.get("last_name") or "")
+        self.db.save_business_buyer(uid, connection_id, name.strip(), when)
+
+    def list_business_buyers(self, chat):
+        buyers = self.db.eligible_business_buyers(self.admin)
+        if not buyers:
+            return self.send(chat,
+                "No eligible buyer chats yet. In Telegram Business → Chatbots, connect this bot "
+                "with Reply permission for your test buyer, then have that buyer message your PERSONAL account. "
+                "Only recent incoming chats (24 hours) can be used.")
+        rows = [[b(f"👤 {x['display_name'][:20]} · {x['chat_id']}", f"bizbuyer:{x['chat_id']}")]
+                for x in buyers]
+        return self.send(chat, "Select a buyer (paid media will appear in your PERSONAL chat):",
+                         inline_buttons(rows))
+
+    def list_business_items(self, chat, buyer_id):
+        buyer = self.db.eligible_business_buyer(buyer_id, self.admin)
+        if not buyer:
+            return self.send(chat, "This buyer is not eligible now. Ask them to message your personal account again.")
+        items = self.db.catalog()
+        if not items:
+            return self.send(chat, "No paid items. Use /add first.")
+        rows = [[b(f"{'🖼' if i['kind']=='photo' else '🎬'} {i['title'][:24]} · ⭐{i['price']}",
+                   f"bizitem:{buyer_id}:{i['id']}")] for i in items]
+        return self.send(chat, f"Select paid media for {buyer['display_name']}:", inline_buttons(rows))
+
+    def prepare_business_send(self, chat, buyer_id, item_id):
+        buyer = self.db.eligible_business_buyer(buyer_id, self.admin)
+        item = self.db.item(item_id)
+        if not buyer or not item or not item["active"]:
+            return self.send(chat, "Buyer/item unavailable. Ask buyer to message your personal chat again if needed.")
+        return self.send(chat, f"Send item #{item_id} ({item['title']}) for ⭐{item['price']} "
+                         f"to buyer {buyer['display_name']}?",
+                         inline_buttons([[b("✅ Send locked media", f"bizconfirm:{buyer_id}:{item_id}")],
+                                         [b("❌ Cancel", "bizcancel")]]))
+
+    def send_business_paid_media(self, chat, buyer_id, item_id):
+        buyer = self.db.eligible_business_buyer(buyer_id, self.admin)
+        item = self.db.item(item_id)
+        if not buyer or not item or not item["active"]:
+            return self.send(chat, "Not sent: the buyer/item is no longer eligible. Check /buyers.")
+        if self.db.recently_offered(buyer_id, item_id):
+            return self.send(chat, "Already sent recently. Check your personal chat with the buyer.")
+        payload = "offer:" + uuid.uuid4().hex
+        self.db.save_offer(payload, buyer_id, item_id, item["price"], buyer["connection_id"])
+        try:
+            self.api.call("sendPaidMedia", {
+                "business_connection_id": buyer["connection_id"],
+                "chat_id": buyer_id,
+                "star_count": item["price"],
+                "media": [{"type": item["kind"], "media": item["file_id"]}],
+                "payload": payload,
+                "caption": item["title"][:1024],
+                "protect_content": True,
+            })
+        except ApiError as exc:
+            self.db.drop_offer(payload)
+            return self.send(chat, f"❌ Telegram rejected the business send: {exc}\n"
+                             "Check buyer's recent message and Business Reply permission.")
+        self.db.mark_sent(payload)
+        return self.send(chat, f"✅ Locked media sent through YOUR connected personal Telegram chat "
+                         f"to {buyer['display_name']}. Buyer sees ⭐{item['price']} Unlock.")
 
     def handle_message(self, msg):
         uid = (msg.get("from") or {}).get("id")
@@ -313,6 +480,13 @@ class StarsBot:
             return self.library(uid, chat)
 
         if uid == self.admin:
+            if cmd == "/buyers":
+                return self.list_business_buyers(chat)
+            if cmd == "/sendbuyer":
+                args = text.split()
+                if len(args) != 3 or not args[1].isdigit() or not args[2].isdigit():
+                    return self.send(chat, "Usage: /sendbuyer BUYER_ID ITEM_ID (or just use /buyers)")
+                return self.prepare_business_send(chat, int(args[1]), int(args[2]))
             if cmd == "/cancel":
                 self.drafts.pop(uid, None)
                 return self.send(chat, "Upload cancelled.")
@@ -385,6 +559,16 @@ class StarsBot:
         if uid is None or chat is None or chat_obj.get("type") != "private" or chat != uid:
             return
         data = cb.get("data", "")
+        if uid == self.admin:
+            parts = data.split(":")
+            if data == "bizcancel":
+                return self.send(chat, "Cancelled.")
+            if len(parts) == 2 and parts[0] == "bizbuyer" and parts[1].isdigit():
+                return self.list_business_items(chat, int(parts[1]))
+            if len(parts) == 3 and parts[0] == "bizitem" and parts[1].isdigit() and parts[2].isdigit():
+                return self.prepare_business_send(chat, int(parts[1]), int(parts[2]))
+            if len(parts) == 3 and parts[0] == "bizconfirm" and parts[1].isdigit() and parts[2].isdigit():
+                return self.send_business_paid_media(chat, int(parts[1]), int(parts[2]))
         if data == "catalog":
             return self.browse(chat)
         if data.startswith("buy:") and data[4:].isdigit():
@@ -393,6 +577,10 @@ class StarsBot:
             return self.again(uid, chat, int(data[6:]))
 
     def handle_update(self, update):
+        if "business_connection" in update:
+            return self.handle_business_connection(update["business_connection"])
+        if "business_message" in update:
+            return self.handle_business_message(update["business_message"])
         if "purchased_paid_media" in update:
             return self.purchased(update["purchased_paid_media"])
         if "callback_query" in update:
@@ -421,7 +609,7 @@ def main():
     while True:
         try:
             updates = api.call("getUpdates", {"offset": offset, "timeout": 30,
-                                               "allowed_updates": ["message", "callback_query", "purchased_paid_media"]},
+                                               "allowed_updates": ["message", "callback_query", "purchased_paid_media", "business_connection", "business_message"]},
                                timeout=45)
             for update in updates:
                 try:
