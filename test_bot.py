@@ -62,5 +62,47 @@ class BotTest(unittest.TestCase):
         self.assertEqual(self.api.calls[-1][0], 'sendMessage')
 
 
+    def test_business_paid_media_sent_via_personal_chat(self):
+        import time
+        self.bot.handle_business_connection({
+            'id': 'connection-A', 'user': {'id': 123}, 'is_enabled': True,
+            'rights': {'can_reply': True}
+        })
+        self.bot.handle_business_message({
+            'business_connection_id': 'connection-A',
+            'chat': {'id': 456, 'type': 'private'},
+            'from': {'id': 456, 'first_name': 'Test'},
+            'date': int(time.time())
+        })
+        self.bot.send_business_paid_media(123, 456, self.item_id)
+        method, sent = [x for x in self.api.calls if x[0]=='sendPaidMedia'][-1]
+        self.assertEqual(sent['business_connection_id'], 'connection-A')
+        self.assertEqual(sent['chat_id'], 456)
+        self.assertEqual(sent['star_count'], 45)
+        self.bot.purchased({'from': {'id': 456}, 'paid_media_payload': sent['payload']})
+        self.assertTrue(self.db.purchased(456, self.item_id))
+        # Business buyers are not sent unsolicited bot-DMs.
+        self.assertEqual(self.api.calls[-1][1]['chat_id'], 123)
+
+    def test_business_connection_is_admin_only_and_requires_recent_buyer(self):
+        import time
+        self.bot.handle_business_connection({
+            'id':'other', 'user':{'id':999}, 'is_enabled':True,
+            'rights':{'can_reply':True}
+        })
+        self.assertIsNone(self.db.business_connection('other'))
+        self.bot.handle_business_connection({
+            'id':'mine', 'user':{'id':123}, 'is_enabled':True,
+            'rights':{'can_reply':True}
+        })
+        self.bot.handle_business_message({
+            'business_connection_id':'mine', 'chat':{'id':456,'type':'private'},
+            'from':{'id':456,'first_name':'Test'}, 'date':int(time.time())-90000
+        })
+        self.assertIsNone(self.db.eligible_business_buyer(456,123))
+        self.bot.handle_message({'from': {'id':456},'chat':{'id':456,'type':'private'},
+                                 'text':'/buyers'})
+        self.assertNotIn('Select a buyer', self.api.calls[-1][1]['text'])
+
 if __name__ == '__main__':
     unittest.main()
